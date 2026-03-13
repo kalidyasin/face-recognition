@@ -26,7 +26,7 @@ Ensure you have a working C++ compiler installed (Visual Studio Build Tools on W
 
 1. **Clone the repository**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/kalidyasin/face-recognition.git
    cd face-recognition
    ```
 
