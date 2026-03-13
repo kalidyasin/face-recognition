@@ -1,11 +1,10 @@
 use anyhow::Result;
-use ndarray::Array;
+use ndarray::{Array, Array1, Array4};
 use ort::session::Session;
 use ort::value::Tensor;
 
 pub struct YoloModel {
     session: Session,
-    input_shape: (u32, u32),
 }
 
 impl YoloModel {
@@ -13,10 +12,7 @@ impl YoloModel {
         println!("  - Building session for {}...", model_path);
         let session = Session::builder()?.commit_from_file(model_path)?;
         println!("  - Session built.");
-        Ok(Self {
-            session,
-            input_shape: (640, 640),
-        })
+        Ok(Self { session })
     }
 
     pub fn detect(
@@ -30,7 +26,6 @@ impl YoloModel {
 
         let mut detections = Vec::new();
 
-        // Check if we have multiple outputs (raw heads) or a single concatenated one
         if outputs.len() > 1 {
             for (_name, value) in outputs.iter() {
                 let (shape, data) = value.try_extract_tensor::<f32>()?;
@@ -82,9 +77,7 @@ impl YoloModel {
                         let mut max_val = -f32::INFINITY;
                         for j in 0..16 {
                             let val = data[(i * 16 + j) * h * w + offset];
-                            if val > max_val {
-                                max_val = val;
-                            }
+                            if val > max_val { max_val = val; }
                         }
                         for j in 0..16 {
                             let exp_val = (data[(i * 16 + j) * h * w + offset] - max_val).exp();
@@ -103,12 +96,15 @@ impl YoloModel {
 
                     let mut keypoints = Vec::new();
                     for i in 0..5 {
-                        let px = data[(65 + i * 3) * h * w + offset];
-                        let py = data[(66 + i * 3) * h * w + offset];
-                        let ps = data[(67 + i * 3) * h * w + offset];
-                        let lx = (px * 2.0 + x as f32) * (stride as f32);
-                        let ly = (py * 2.0 + y as f32) * (stride as f32);
-                        let ls = sigmoid(ps);
+                        let px_raw = data[(65 + i * 3) * h * w + offset];
+                        let py_raw = data[(66 + i * 3) * h * w + offset];
+                        let ps_raw = data[(67 + i * 3) * h * w + offset];
+
+                        // YOLOv8 landmarks are often offsets from grid center
+                        // Removed the previous sigmoid/offset combo that caused misalignment
+                        let lx = (px_raw * 2.0 + x as f32) * (stride as f32);
+                        let ly = (py_raw * 2.0 + y as f32) * (stride as f32);
+                        let ls = sigmoid(ps_raw);
                         keypoints.push((lx, ly, ls));
                     }
 
@@ -116,7 +112,6 @@ impl YoloModel {
                         bbox: (x1, y1, x2 - x1, y2 - y1),
                         score,
                         keypoints,
-                        class_id: 0,
                     });
                 }
             }
@@ -161,11 +156,48 @@ impl YoloModel {
                     bbox: (x1, y1, w, h),
                     score,
                     keypoints,
-                    class_id: 0,
                 });
             }
         }
     }
+}
+
+pub struct FaceRecognizer {
+    session: Session,
+}
+
+impl FaceRecognizer {
+    pub fn new(model_path: &str) -> Result<Self> {
+        println!("  - Building session for {}...", model_path);
+        let session = Session::builder()?.commit_from_file(model_path)?;
+        println!("  - Session built.");
+        Ok(Self { session })
+    }
+
+    pub fn get_embedding(&mut self, face_img: &image::RgbImage) -> Result<Array1<f32>> {
+        let resized = image::imageops::resize(face_img, 112, 112, image::imageops::FilterType::Triangle);
+        let mut input = Array4::zeros((1, 3, 112, 112));
+        for (x, y, pixel) in resized.enumerate_pixels() {
+            let [r, g, b] = pixel.0;
+            // ArcFace uses BGR
+            input[[0, 0, y as usize, x as usize]] = (b as f32 - 127.5) / 128.0;
+            input[[0, 1, y as usize, x as usize]] = (g as f32 - 127.5) / 128.0;
+            input[[0, 2, y as usize, x as usize]] = (r as f32 - 127.5) / 128.0;
+        }
+        let tensor = Tensor::from_array(input)?;
+        let inputs = ort::inputs!["data" => tensor];
+        let outputs = self.session.run(inputs)?;
+        let output_value = &outputs["fc1"];
+        let (_, data) = output_value.try_extract_tensor::<f32>()?;
+        let mut embedding = Array1::from_vec(data.to_vec());
+        let norm = embedding.dot(&embedding).sqrt();
+        embedding /= norm.max(1e-6);
+        Ok(embedding)
+    }
+}
+
+pub fn cosine_similarity(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+    a.dot(b)
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -177,5 +209,4 @@ pub struct Detection {
     pub bbox: (f32, f32, f32, f32), // x, y, w, h
     pub score: f32,
     pub keypoints: Vec<(f32, f32, f32)>, // x, y, conf
-    pub class_id: usize,
 }
