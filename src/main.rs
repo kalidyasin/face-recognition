@@ -10,7 +10,8 @@ use nokhwa::{
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use ndarray::Array1;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
+use std::collections::HashMap;
 
 mod models;
 mod utils;
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
     let mut pose_model = YoloModel::new(pose_model_path)?;
     let mut recog_model = FaceRecognizer::new(recog_model_path)?;
 
-    println!("Loading known faces from 'known_faces/' subdirectories...");
+    println!("Loading known faces...");
     let mut known_people = load_known_people(&mut face_model, &mut recog_model)?;
     println!("Loaded {} known people.", known_people.len());
 
@@ -94,48 +95,55 @@ fn load_known_people(face_model: &mut YoloModel, recog_model: &mut FaceRecognize
     let base_dir = Path::new("known_faces");
     if !base_dir.exists() {
         std::fs::create_dir_all(base_dir)?;
-        println!("Created 'known_faces/' folder. Usage: known_faces/<Name>/<image.jpg>");
         return Ok(vec![]);
     }
 
-    let mut people = Vec::new();
+    let mut people_map: HashMap<String, Vec<Array1<f32>>> = HashMap::new();
+
     for entry in std::fs::read_dir(base_dir)? {
         let entry = entry?;
         let path = entry.path();
+        
         if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let mut embeddings = Vec::new();
-            println!("  Loading {}...", name);
-            
             for img_entry in std::fs::read_dir(&path)? {
                 let img_path = img_entry?.path();
-                if img_path.is_file() && (img_path.extension().map_or(false, |e| e=="jpg" || e=="png" || e=="jpeg")) {
-                    if let Ok(img) = image::open(&img_path) {
-                        let rgb = img.to_rgb8();
-                        let (input, scale, dx, dy) = preprocess_yolo(&DynamicImage::ImageRgb8(rgb.clone()), (640, 640));
-                        if let Ok(dets) = face_model.detect(input, 0.5) {
-                            if let Some(det) = dets.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap()) {
-                                let x = (((det.bbox.0 - dx) / scale).max(0.0) as u32).min(rgb.width()-1);
-                                let y = (((det.bbox.1 - dy) / scale).max(0.0) as u32).min(rgb.height()-1);
-                                let w = (det.bbox.2 / scale) as u32; let h = (det.bbox.3 / scale) as u32;
-                                let w = w.min(rgb.width() - x); let h = h.min(rgb.height() - y);
-                                if w > 0 && h > 0 {
-                                    let face_crop = image::imageops::crop_imm(&rgb, x, y, w, h).to_image();
-                                    if let Ok(emb) = recog_model.get_embedding(&face_crop) {
-                                        embeddings.push(emb);
-                                    }
-                                }
-                            }
-                        }
+                if is_image(&img_path) {
+                    if let Ok(emb) = extract_embedding_from_file(&img_path, face_model, recog_model) {
+                        people_map.entry(name.clone()).or_default().push(emb);
                     }
                 }
             }
-            if !embeddings.is_empty() {
-                people.push(KnownPerson { name, embeddings });
+        } else if is_image(&path) {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            if let Ok(emb) = extract_embedding_from_file(&path, face_model, recog_model) {
+                people_map.entry(name).or_default().push(emb);
             }
         }
     }
-    Ok(people)
+
+    Ok(people_map.into_iter().map(|(name, embeddings)| KnownPerson { name, embeddings }).collect())
+}
+
+fn is_image(path: &Path) -> bool {
+    path.is_file() && (path.extension().map_or(false, |e| e=="jpg" || e=="png" || e=="jpeg"))
+}
+
+fn extract_embedding_from_file(path: &Path, face_model: &mut YoloModel, recog_model: &mut FaceRecognizer) -> Result<Array1<f32>> {
+    let img = image::open(path)?;
+    let rgb = img.to_rgb8();
+    let (input, scale, dx, dy) = preprocess_yolo(&DynamicImage::ImageRgb8(rgb.clone()), (640, 640));
+    let dets = face_model.detect(input, 0.5)?;
+    let det = dets.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+        .ok_or_else(|| anyhow::anyhow!("No face in {}", path.display()))?;
+    
+    let x = (((det.bbox.0 - dx) / scale).max(0.0) as u32).min(rgb.width()-1);
+    let y = (((det.bbox.1 - dy) / scale).max(0.0) as u32).min(rgb.height()-1);
+    let w = (det.bbox.2 / scale) as u32; let h = (det.bbox.3 / scale) as u32;
+    let w = w.min(rgb.width() - x); let h = h.min(rgb.height() - y);
+    
+    let face_crop = image::imageops::crop_imm(&rgb, x, y, w, h).to_image();
+    recog_model.get_embedding(&face_crop)
 }
 
 fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloModel, recog_model: &mut FaceRecognizer, known: &mut Vec<KnownPerson>) -> Result<()> {
@@ -147,43 +155,61 @@ fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloMod
     let width = camera.resolution().width_x;
     let height = camera.resolution().height_y;
     
-    let mut window = Window::new("Face & Body Tracking - [S] to Save Face", width as usize, height as usize, WindowOptions::default())?;
+    let mut window = Window::new("AI Face Tracker - [S] Save | [R] Reload", width as usize, height as usize, WindowOptions::default())?;
     window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
 
     let mut last_processed_frame: Option<image::RgbImage> = None;
     let mut last_detections: Vec<Detection> = Vec::new();
+    let mut unknown_trackers: HashMap<usize, (Instant, image::RgbImage, Array1<f32>)> = HashMap::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let frame = camera.frame()?;
         let mut rgb_image = frame.decode_image::<RgbFormat>()?;
         
-        // Enrollment Key
-        if window.is_key_pressed(Key::S, minifb::KeyRepeat::No) {
-            if let Some(det) = last_detections.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap()) {
-                if let Some(ref last_img) = last_processed_frame {
-                    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                    let name = format!("Person_{}", ts);
-                    let folder = PathBuf::from("known_faces").join(&name);
-                    std::fs::create_dir_all(&folder)?;
-                    
-                    let (scale, dx, dy) = utils::get_scale_params(last_img.width(), last_img.height(), 640, 640);
-                    let x = (((det.bbox.0 - dx) / scale).max(0.0) as u32).min(last_img.width()-1);
-                    let y = (((det.bbox.1 - dy) / scale).max(0.0) as u32).min(last_img.height()-1);
-                    let w = ((det.bbox.2 / scale) as u32).min(last_img.width() - x);
-                    let h = ((det.bbox.3 / scale) as u32).min(last_img.height() - y);
-                    
-                    let face_crop = image::imageops::crop_imm(last_img, x, y, w, h).to_image();
-                    face_crop.save(folder.join("face.jpg"))?;
-                    
-                    if let Ok(emb) = recog_model.get_embedding(&face_crop) {
-                        known.push(KnownPerson { name: name.clone(), embeddings: vec![emb] });
-                        println!("Enrolled new person: {}", name);
-                    }
-                }
+        // Manual Reload
+        if window.is_key_pressed(Key::R, minifb::KeyRepeat::No) {
+            println!("Reloading database...");
+            if let Ok(new_known) = load_known_people(face_model, recog_model) {
+                *known = new_known;
+                println!("Database reloaded.");
             }
         }
 
-        let (display_buffer, num_faces, _, current_dets) = process_frame(&mut rgb_image, face_model, pose_model, recog_model, known)?;
+        let (display_buffer, num_faces, _, current_dets, recognitions) = process_frame(&mut rgb_image, face_model, pose_model, recog_model, known)?;
+        
+        // Auto-Enrollment Logic
+        for (idx, (name, emb)) in recognitions.iter().enumerate() {
+            if name == "Unknown" {
+                let entry = unknown_trackers.entry(idx).or_insert_with(|| (Instant::now(), RgbImage::new(1,1), emb.clone()));
+                // Update the best crop for this unknown face
+                if let Some(det) = current_dets.get(idx) {
+                    let (scale, dx, dy) = utils::get_scale_params(rgb_image.width(), rgb_image.height(), 640, 640);
+                    let x = (((det.bbox.0 - dx) / scale).max(0.0) as u32).min(rgb_image.width()-1);
+                    let y = (((det.bbox.1 - dy) / scale).max(0.0) as u32).min(rgb_image.height()-1);
+                    let w = ((det.bbox.2 / scale) as u32).min(rgb_image.width() - x);
+                    let h = ((det.bbox.3 / scale) as u32).min(rgb_image.height() - y);
+                    if w > 10 && h > 10 {
+                        entry.1 = image::imageops::crop_imm(&rgb_image, x, y, w, h).to_image();
+                    }
+                }
+
+                // If seen for > 1.5 seconds, enroll
+                if entry.0.elapsed() > Duration::from_millis(1500) {
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                    let new_name = format!("Person_{}", ts);
+                    let folder = PathBuf::from("known_faces").join(&new_name);
+                    std::fs::create_dir_all(&folder)?;
+                    entry.1.save(folder.join("auto_enrolled.jpg"))?;
+                    
+                    known.push(KnownPerson { name: new_name.clone(), embeddings: vec![emb.clone()] });
+                    println!("Auto-Enrolled: {}", new_name);
+                    unknown_trackers.remove(&idx);
+                }
+            } else {
+                unknown_trackers.remove(&idx);
+            }
+        }
+
         last_processed_frame = Some(rgb_image.clone());
         last_detections = current_dets;
 
@@ -195,8 +221,7 @@ fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloMod
 fn run_image(path: &str, face_model: &mut YoloModel, pose_model: &mut YoloModel, recog_model: &mut FaceRecognizer, known: &[KnownPerson]) -> Result<()> {
     let img = image::open(path)?;
     let mut rgb_image = img.to_rgb8();
-    let (display_buffer, _, _, _) = process_frame(&mut rgb_image, face_model, pose_model, recog_model, known)?;
-    // (Optional: Convert buffer back or just save rgb_image since process_frame modifies it)
+    let _ = process_frame(&mut rgb_image, face_model, pose_model, recog_model, known)?;
     rgb_image.save("output.jpg")?;
     println!("Saved result to output.jpg");
     Ok(())
@@ -208,7 +233,7 @@ fn process_frame(
     pose_model: &mut YoloModel,
     recog_model: &mut FaceRecognizer,
     known: &[KnownPerson]
-) -> Result<(Vec<u32>, usize, usize, Vec<Detection>)> {
+) -> Result<(Vec<u32>, usize, usize, Vec<Detection>, Vec<(String, Array1<f32>)>)> {
     let (input, scale, dx, dy) = utils::preprocess_yolo(&DynamicImage::ImageRgb8(img.clone()), (640, 640));
 
     let face_dets = face_model.detect(input.clone(), 0.4)?;
@@ -221,6 +246,7 @@ fn process_frame(
     let keep_faces = utils::nms(&face_boxes, 0.45);
 
     let mut processed_face_dets = Vec::new();
+    let mut recognitions = Vec::new();
 
     for &idx in &keep_faces {
         let det = &face_dets[idx];
@@ -231,26 +257,32 @@ fn process_frame(
         let h_box = det.bbox.3 / scale;
         
         let mut name = "Unknown".to_string();
+        let mut current_emb = Array1::zeros(512);
+
         let x = (x_raw as u32).min(img.width()-1);
         let y = (y_raw as u32).min(img.height()-1);
         let w = (w_box as u32).min(img.width() - x);
         let h = (h_box as u32).min(img.height() - y);
 
-        if w > 0 && h > 0 && !known.is_empty() {
+        if w > 10 && h > 10 {
             let face_crop = image::imageops::crop_imm(img, x, y, w, h).to_image();
             if let Ok(emb) = recog_model.get_embedding(&face_crop) {
+                current_emb = emb.clone();
                 let mut best_score = 0.0;
                 for person in known {
                     for person_emb in &person.embeddings {
                         let score = models::cosine_similarity(&emb, person_emb);
                         if score > best_score {
                             best_score = score;
-                            if score > 0.45 { name = format!("{} ({:.2})", person.name, score); }
+                            if score > 0.35 { // Lowered threshold for better matching
+                                name = format!("{} ({:.2})", person.name, score);
+                            }
                         }
                     }
                 }
             }
         }
+        recognitions.push((name.clone(), current_emb));
 
         utils::draw_bbox(img, (x_raw, y_raw, w_box, h_box), Rgb([0, 255, 0]), Some(&name));
         
@@ -275,7 +307,7 @@ fn process_frame(
     }
 
     let buffer: Vec<u32> = img.as_raw().par_chunks_exact(3).map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)).collect();
-    Ok((buffer, keep_faces.len(), keep_pose.len(), processed_face_dets))
+    Ok((buffer, keep_faces.len(), keep_pose.len(), processed_face_dets, recognitions))
 }
 
 const SKELETON: [(usize, usize); 12] = [(15,13),(13,11),(16,14),(14,12),(11,12),(5,11),(6,12),(5,6),(5,7),(6,8),(7,9),(8,10)];
