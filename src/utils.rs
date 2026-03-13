@@ -1,9 +1,12 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
-use imageproc::drawing::{draw_line_segment_mut, draw_hollow_rect_mut};
+use imageproc::drawing::draw_hollow_rect_mut;
 use ndarray::{Array, Array4};
 
 // Pre-process image for YOLO (Letterbox resize - Centered)
-pub fn preprocess_yolo(img: &DynamicImage, target_size: (u32, u32)) -> (Array4<f32>, f32, f32, f32) {
+pub fn preprocess_yolo(
+    img: &DynamicImage,
+    target_size: (u32, u32),
+) -> (Array4<f32>, f32, f32, f32) {
     let (w, h) = img.dimensions();
     let (tw, th) = target_size;
 
@@ -13,12 +16,12 @@ pub fn preprocess_yolo(img: &DynamicImage, target_size: (u32, u32)) -> (Array4<f
 
     let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
     let resized_rgb = resized.to_rgb8();
-    
+
     let mut canvas = ImageBuffer::from_pixel(tw, th, Rgb([114, 114, 114]));
-    
+
     let dx = (tw - new_w) / 2;
     let dy = (th - new_h) / 2;
-    
+
     image::imageops::overlay(&mut canvas, &resized_rgb, dx as i64, dy as i64);
 
     let mut input = Array::zeros((1, 3, th as usize, tw as usize));
@@ -33,7 +36,12 @@ pub fn preprocess_yolo(img: &DynamicImage, target_size: (u32, u32)) -> (Array4<f
 }
 
 // Draw bounding box
-pub fn draw_bbox(img: &mut RgbImage, rect: (f32, f32, f32, f32), color: Rgb<u8>, _label: Option<&str>) {
+pub fn draw_bbox(
+    img: &mut RgbImage,
+    rect: (f32, f32, f32, f32),
+    color: Rgb<u8>,
+    _label: Option<&str>,
+) {
     let (x, y, w, h) = rect;
     let rw = w.round() as u32;
     let rh = h.round() as u32;
@@ -63,13 +71,22 @@ pub fn iou(box1: &(f32, f32, f32, f32), box2: &(f32, f32, f32, f32)) -> f32 {
     let area2 = w2 * h2;
     let union_area = area1 + area2 - inter_area;
 
-    if union_area == 0.0 { 0.0 } else { inter_area / union_area }
+    if union_area == 0.0 {
+        0.0
+    } else {
+        inter_area / union_area
+    }
 }
 
 // NMS
 pub fn nms(boxes: &Vec<(f32, f32, f32, f32, f32, usize)>, iou_threshold: f32) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..boxes.len()).collect();
-    indices.sort_by(|&a, &b| boxes[b].4.partial_cmp(&boxes[a].4).unwrap_or(std::cmp::Ordering::Equal));
+    indices.sort_by(|&a, &b| {
+        boxes[b]
+            .4
+            .partial_cmp(&boxes[a].4)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut keep = Vec::new();
     while !indices.is_empty() {
@@ -78,11 +95,16 @@ pub fn nms(boxes: &Vec<(f32, f32, f32, f32, f32, usize)>, iou_threshold: f32) ->
         // Only keep boxes that have IoU <= threshold
         let mut next_indices = Vec::new();
         for &idx in indices.iter().skip(1) {
-             let box1 = (boxes[current].0, boxes[current].1, boxes[current].2, boxes[current].3);
-             let box2 = (boxes[idx].0, boxes[idx].1, boxes[idx].2, boxes[idx].3);
-             if iou(&box1, &box2) <= iou_threshold {
-                 next_indices.push(idx);
-             }
+            let box1 = (
+                boxes[current].0,
+                boxes[current].1,
+                boxes[current].2,
+                boxes[current].3,
+            );
+            let box2 = (boxes[idx].0, boxes[idx].1, boxes[idx].2, boxes[idx].3);
+            if iou(&box1, &box2) <= iou_threshold {
+                next_indices.push(idx);
+            }
         }
         indices = next_indices;
     }

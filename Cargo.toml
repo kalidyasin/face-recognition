@@ -10,6 +10,7 @@ ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray = "0.17"
 image = "0.25"
 imageproc = "0.25"
+rayon = "1.8"
 rusttype = "0.9"
 reqwest = { version = "0.11", features = ["blocking"] }
 anyhow = "1.0"
