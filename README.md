@@ -16,7 +16,19 @@ A real-time face detection, facial landmark tracing, and human pose estimation a
 Install the required system libraries for camera access and windowing:
 ```bash
 sudo apt-get update
-sudo apt-get install -y libfontconfig1-dev libasound2-dev libv4l-dev libx11-dev libwayland-dev
+sudo apt-get install -y clang libclang-dev libfontconfig1-dev libasound2-dev libv4l-dev libx11-dev libwayland-dev
+```
+
+### Linux (Fedora)
+Install the required system libraries:
+```bash
+sudo dnf install clang clang-devel fontconfig-devel alsa-lib-devel libv4l-devel libX11-devel wayland-devel
+```
+
+### Linux (Arch)
+Install the required system libraries:
+```bash
+sudo pacman -S clang fontconfig alsa-lib v4l-utils libx11 wayland
 ```
 
 ### Windows/macOS
