@@ -152,18 +152,19 @@ fn process_frame(
     let (input, scale, dx, dy) = utils::preprocess_yolo(&DynamicImage::ImageRgb8(img.clone()), (640, 640));
 
     // 2. Inference
-    let face_dets = face_model.detect(input.clone(), 0.5)?;
-    let pose_dets = pose_model.detect(input, 0.5)?;
+    let face_dets = face_model.detect(input.clone(), 0.4)?;
+    let pose_dets = pose_model.detect(input, 0.4)?;
 
     // 3. Post-process & Draw (Face)
     let mut face_boxes = Vec::new();
     for (i, det) in face_dets.iter().enumerate() {
         face_boxes.push((det.bbox.0, det.bbox.1, det.bbox.2, det.bbox.3, det.score, i));
     }
-    let keep_faces = utils::nms(&face_boxes, 0.5); // IoU threshold
+    let keep_faces = utils::nms(&face_boxes, 0.45); // IoU threshold
 
     for &idx in &keep_faces {
         let det = &face_dets[idx];
+        
         // Scale back coordinates
         let x = (det.bbox.0 - dx) / scale;
         let y = (det.bbox.1 - dy) / scale;
@@ -171,12 +172,33 @@ fn process_frame(
         let h_box = det.bbox.3 / scale;
         
         utils::draw_bbox(img, (x, y, w_box, h_box), Rgb([0, 255, 0]), Some("Face"));
-        
-        // Draw landmarks
-        for (kx, ky, _kc) in &det.keypoints {
+
+        for (i, (kx, ky, _kc)) in det.keypoints.iter().enumerate() {
             let rx = (kx - dx) / scale;
             let ry = (ky - dy) / scale;
-            imageproc::drawing::draw_filled_circle_mut(img, (rx as i32, ry as i32), 2, Rgb([255, 0, 0]));
+            
+            let color = match i {
+                0 | 1 => Rgb([0, 255, 255]), // Eyes (Cyan)
+                2 => Rgb([255, 255, 0]),     // Nose (Yellow)
+                3 | 4 => Rgb([255, 0, 255]), // Mouth (Magenta)
+                _ => Rgb([255, 0, 0]),       // Others
+            };
+            
+            imageproc::drawing::draw_filled_circle_mut(img, (rx as i32, ry as i32), 3, color);
+        }
+
+        // Draw mouth line with a slightly thicker or more prominent visual
+        if det.keypoints.len() >= 5 {
+            let m1 = &det.keypoints[3];
+            let m2 = &det.keypoints[4];
+            let x1 = (m1.0 - dx) / scale;
+            let y1 = (m1.1 - dy) / scale;
+            let x2 = (m2.0 - dx) / scale;
+            let y2 = (m2.1 - dy) / scale;
+            
+            // Draw a few lines to make it thicker
+            imageproc::drawing::draw_line_segment_mut(img, (x1, y1), (x2, y2), Rgb([255, 0, 255]));
+            imageproc::drawing::draw_line_segment_mut(img, (x1, y1 + 1.0), (x2, y2 + 1.0), Rgb([255, 0, 255]));
         }
     }
 
