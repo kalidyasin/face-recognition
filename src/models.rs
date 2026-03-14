@@ -21,6 +21,8 @@ impl YoloModel {
         conf_threshold: f32,
     ) -> Result<Vec<Detection>> {
         let tensor = Tensor::from_array(input_tensor)?;
+        // Use positional inputs for robustness if names are uncertain, 
+        // but YOLOv8 exports usually name it "images"
         let inputs = ort::inputs!["images" => tensor];
         let outputs = self.session.run(inputs)?;
 
@@ -100,8 +102,6 @@ impl YoloModel {
                         let py_raw = data[(66 + i * 3) * h * w + offset];
                         let ps_raw = data[(67 + i * 3) * h * w + offset];
 
-                        // YOLOv8 landmarks are often offsets from grid center
-                        // Removed the previous sigmoid/offset combo that caused misalignment
                         let lx = (px_raw * 2.0 + x as f32) * (stride as f32);
                         let ly = (py_raw * 2.0 + y as f32) * (stride as f32);
                         let ls = sigmoid(ps_raw);
@@ -179,16 +179,21 @@ impl FaceRecognizer {
         let mut input = Array4::zeros((1, 3, 112, 112));
         for (x, y, pixel) in resized.enumerate_pixels() {
             let [r, g, b] = pixel.0;
-            // ArcFace uses BGR
+            // Preprocessing: BGR and (pixel - 127.5) / 128.0
             input[[0, 0, y as usize, x as usize]] = (b as f32 - 127.5) / 128.0;
             input[[0, 1, y as usize, x as usize]] = (g as f32 - 127.5) / 128.0;
             input[[0, 2, y as usize, x as usize]] = (r as f32 - 127.5) / 128.0;
         }
         let tensor = Tensor::from_array(input)?;
-        let inputs = ort::inputs!["data" => tensor];
+        
+        // Auto-detect input name for the recognition model
+        let input_name = self.session.inputs()[0].name().to_string();
+        let inputs: Vec<(String, ort::session::SessionInputValue)> = vec![(input_name, tensor.into())];
+        
         let outputs = self.session.run(inputs)?;
-        let output_value = &outputs["fc1"];
+        let output_value = outputs.values().next().unwrap();
         let (_, data) = output_value.try_extract_tensor::<f32>()?;
+        
         let mut embedding = Array1::from_vec(data.to_vec());
         let norm = embedding.dot(&embedding).sqrt();
         embedding /= norm.max(1e-6);
@@ -206,7 +211,7 @@ fn sigmoid(x: f32) -> f32 {
 
 #[derive(Debug, Clone)]
 pub struct Detection {
-    pub bbox: (f32, f32, f32, f32), // x, y, w, h
+    pub bbox: (f32, f32, f32, f32),
     pub score: f32,
-    pub keypoints: Vec<(f32, f32, f32)>, // x, y, conf
+    pub keypoints: Vec<(f32, f32, f32)>,
 }
