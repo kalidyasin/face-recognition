@@ -17,7 +17,6 @@ mod models;
 mod utils;
 
 use models::{YoloModel, FaceRecognizer, Detection};
-use utils::preprocess_yolo;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -106,22 +105,13 @@ fn load_known_people(recog_model: &mut FaceRecognizer) -> Result<Vec<KnownPerson
         
         if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            println!("  Scanning folder: {}...", name);
             for img_entry in std::fs::read_dir(&path)? {
                 let img_path = img_entry?.path();
                 if is_image(&img_path) {
-                    println!("    Found image: {:?}", img_path.file_name().unwrap());
-                    match image::open(&img_path) {
-                        Ok(img) => {
-                            match recog_model.get_embedding(&img.to_rgb8()) {
-                                Ok(emb) => {
-                                    println!("      + Successfully loaded embedding");
-                                    people_map.entry(name.clone()).or_default().push(emb);
-                                }
-                                Err(e) => println!("      - Failed to get embedding: {}", e),
-                            }
+                    if let Ok(img) = image::open(&img_path) {
+                        if let Ok(emb) = recog_model.get_embedding(&img.to_rgb8()) {
+                            people_map.entry(name.clone()).or_default().push(emb);
                         }
-                        Err(e) => println!("      - Failed to open image: {}", e),
                     }
                 }
             }
@@ -129,7 +119,6 @@ fn load_known_people(recog_model: &mut FaceRecognizer) -> Result<Vec<KnownPerson
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             if let Ok(img) = image::open(&path) {
                 if let Ok(emb) = recog_model.get_embedding(&img.to_rgb8()) {
-                    println!("  + Loaded file: {}", name);
                     people_map.entry(name).or_default().push(emb);
                 }
             }
@@ -152,60 +141,63 @@ fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloMod
     let width = camera.resolution().width_x;
     let height = camera.resolution().height_y;
     
-    let mut window = Window::new("AI Face Tracker - [R] Reload", width as usize, height as usize, WindowOptions::default())?;
+    let mut window = Window::new("AI Tracker - [R] Reload", width as usize, height as usize, WindowOptions::default())?;
     window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
 
     let mut unknown_trackers: HashMap<usize, (Instant, RgbImage, Array1<f32>)> = HashMap::new();
     let mut last_enrollment_time = Instant::now();
+    
+    // Performance Cache: Only run recognition every N frames
+    let mut frame_count = 0;
+    let mut recog_cache: Vec<String> = Vec::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let frame = camera.frame()?;
         let mut rgb_image = frame.decode_image::<RgbFormat>()?;
         
         if window.is_key_pressed(Key::R, minifb::KeyRepeat::No) {
-            println!("Reloading database...");
             if let Ok(new_known) = load_known_people(recog_model) {
                 *known = new_known;
                 println!("Database reloaded. People: {}", known.len());
             }
         }
 
-        let (face_dets, pose_dets, recognitions) = analyze_frame(&rgb_image, face_model, pose_model, recog_model, known)?;
+        // Run Recognition every 3 frames to reduce lag
+        let run_recog = frame_count % 3 == 0;
+        let (face_dets, pose_dets, recognitions) = analyze_frame(&rgb_image, face_model, pose_model, recog_model, known, run_recog, &recog_cache)?;
         
+        if run_recog {
+            recog_cache = recognitions.iter().map(|(name, _)| name.clone()).collect();
+        }
+
+        // Auto-Enrollment Logic
         let mut active_indices = Vec::new();
         for (idx, (name, emb)) in recognitions.iter().enumerate() {
             if name == "Unknown" {
                 active_indices.push(idx);
                 let entry = unknown_trackers.entry(idx).or_insert_with(|| (Instant::now(), RgbImage::new(1,1), emb.clone()));
-                
                 if let Some(det) = face_dets.get(idx) {
                     let (scale, dx, dy) = utils::get_scale_params(rgb_image.width(), rgb_image.height(), 640, 640);
                     let x = (((det.bbox.0 - dx) / scale).max(0.0) as u32).min(rgb_image.width()-1);
                     let y = (((det.bbox.1 - dy) / scale).max(0.0) as u32).min(rgb_image.height()-1);
                     let w = ((det.bbox.2 / scale) as u32).min(rgb_image.width() - x);
                     let h = ((det.bbox.3 / scale) as u32).min(rgb_image.height() - y);
-                    if w > 20 && h > 20 {
-                        entry.1 = image::imageops::crop_imm(&rgb_image, x, y, w, h).to_image();
-                    }
+                    if w > 20 && h > 20 { entry.1 = image::imageops::crop_imm(&rgb_image, x, y, w, h).to_image(); }
                 }
 
-                // If seen for > 3 seconds AND we haven't enrolled recently
                 if entry.0.elapsed() > Duration::from_millis(3000) && last_enrollment_time.elapsed() > Duration::from_millis(5000) {
-                    // One last check: Is this "Unknown" actually close to someone we just enrolled?
                     let mut really_unknown = true;
                     for p in known.iter() {
                         for p_emb in &p.embeddings {
-                            if models::cosine_similarity(emb, p_emb) > 0.25 { really_unknown = false; break; }
+                            if models::cosine_similarity(emb, p_emb) > 0.35 { really_unknown = false; break; }
                         }
                     }
-
                     if really_unknown {
                         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                         let new_name = format!("Person_{}", ts);
                         let folder = PathBuf::from("known_faces").join(&new_name);
                         std::fs::create_dir_all(&folder)?;
                         entry.1.save(folder.join("auto_enrolled.jpg"))?;
-                        
                         known.push(KnownPerson { name: new_name.clone(), embeddings: vec![emb.clone()] });
                         println!("Auto-Enrolled: {}", new_name);
                         last_enrollment_time = Instant::now();
@@ -220,6 +212,7 @@ fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloMod
         let (display_buffer, nf, np) = draw_overlay(&mut rgb_image, &face_dets, &pose_dets, &recognitions)?;
         window.set_title(&format!("Faces: {} | Bodies: {} | Database: {}", nf, np, known.len()));
         window.update_with_buffer(&display_buffer, width as usize, height as usize)?;
+        frame_count += 1;
     }
     Ok(())
 }
@@ -227,7 +220,7 @@ fn run_realtime(index: u32, face_model: &mut YoloModel, pose_model: &mut YoloMod
 fn run_image(path: &str, face_model: &mut YoloModel, pose_model: &mut YoloModel, recog_model: &mut FaceRecognizer, known: &[KnownPerson]) -> Result<()> {
     let img = image::open(path)?;
     let mut rgb_image = img.to_rgb8();
-    let (face_dets, pose_dets, recognitions) = analyze_frame(&rgb_image, face_model, pose_model, recog_model, known)?;
+    let (face_dets, pose_dets, recognitions) = analyze_frame(&rgb_image, face_model, pose_model, recog_model, known, true, &vec![])?;
     let _ = draw_overlay(&mut rgb_image, &face_dets, &pose_dets, &recognitions)?;
     rgb_image.save("output.jpg")?;
     println!("Saved result to output.jpg");
@@ -239,7 +232,9 @@ fn analyze_frame(
     face_model: &mut YoloModel,
     pose_model: &mut YoloModel,
     recog_model: &mut FaceRecognizer,
-    known: &[KnownPerson]
+    known: &[KnownPerson],
+    run_recog: bool,
+    cached_names: &Vec<String>
 ) -> Result<(Vec<Detection>, Vec<Detection>, Vec<(String, Array1<f32>)>)> {
     let (input, scale, dx, dy) = utils::preprocess_yolo(&DynamicImage::ImageRgb8(img.clone()), (640, 640));
 
@@ -254,42 +249,43 @@ fn analyze_frame(
     let mut face_dets = Vec::new();
     let mut recognitions = Vec::new();
 
-    for &idx in &keep_faces {
+    for (idx_in_keep, &idx) in keep_faces.iter().enumerate() {
         let det = &face_raw_dets[idx];
         face_dets.push(det.clone());
-        
-        let x_raw = ((det.bbox.0 - dx) / scale).max(0.0);
-        let y_raw = ((det.bbox.1 - dy) / scale).max(0.0);
-        let w_box = det.bbox.2 / scale;
-        let h_box = det.bbox.3 / scale;
         
         let mut name = "Unknown".to_string();
         let mut current_emb = Array1::zeros(512);
 
-        let x = (x_raw as u32).min(img.width()-1);
-        let y = (y_raw as u32).min(img.height()-1);
-        let w = (w_box as u32).min(img.width() - x);
-        let h = (h_box as u32).min(img.height() - y);
+        if run_recog {
+            let x_raw = ((det.bbox.0 - dx) / scale).max(0.0);
+            let y_raw = ((det.bbox.1 - dy) / scale).max(0.0);
+            let w_box = det.bbox.2 / scale;
+            let h_box = det.bbox.3 / scale;
+            let x = (x_raw as u32).min(img.width()-1);
+            let y = (y_raw as u32).min(img.height()-1);
+            let w = (w_box as u32).min(img.width() - x);
+            let h = (h_box as u32).min(img.height() - y);
 
-        if w > 10 && h > 10 {
-            let face_crop = image::imageops::crop_imm(img, x, y, w, h).to_image();
-            if let Ok(emb) = recog_model.get_embedding(&face_crop) {
-                current_emb = emb.clone();
-                let mut best_score = 0.0;
-                let mut best_name = "Unknown".to_string();
-                for person in known {
-                    for person_emb in &person.embeddings {
-                        let score = models::cosine_similarity(&emb, person_emb);
-                        if score > best_score { 
-                            best_score = score;
-                            best_name = person.name.clone();
+            if w > 10 && h > 10 {
+                let face_crop = image::imageops::crop_imm(img, x, y, w, h).to_image();
+                if let Ok(emb) = recog_model.get_embedding(&face_crop) {
+                    current_emb = emb.clone();
+                    let mut best_score = 0.0;
+                    let mut best_name = "Unknown".to_string();
+                    for person in known {
+                        for person_emb in &person.embeddings {
+                            let score = models::cosine_similarity(&emb, person_emb);
+                            if score > best_score { 
+                                best_score = score;
+                                best_name = person.name.clone();
+                            }
                         }
                     }
-                }
-                if best_score > 0.35 {
-                    name = format!("{} ({:.2})", best_name, best_score);
+                    if best_score > 0.35 { name = format!("{} ({:.2})", best_name, best_score); }
                 }
             }
+        } else if let Some(cached) = cached_names.get(idx_in_keep) {
+            name = cached.clone();
         }
         recognitions.push((name, current_emb));
     }
@@ -300,9 +296,7 @@ fn analyze_frame(
     }
     let keep_pose = utils::nms(&pose_boxes, 0.45);
     let mut pose_dets = Vec::new();
-    for &idx in &keep_pose {
-        pose_dets.push(pose_raw_dets[idx].clone());
-    }
+    for &idx in &keep_pose { pose_dets.push(pose_raw_dets[idx].clone()); }
 
     Ok((face_dets, pose_dets, recognitions))
 }
@@ -350,6 +344,12 @@ fn draw_skeleton(img: &mut RgbImage, kpts: &Vec<(f32,f32,f32)>, dx: f32, dy: f32
             if c1 > 0.4 && c2 > 0.4 {
                 imageproc::drawing::draw_line_segment_mut(img, ((x1-dx)/scale, (y1-dy)/scale), ((x2-dx)/scale, (y2-dy)/scale), Rgb([0,100,255]));
             }
+        }
+    }
+    // RESTORED: Draw dots (joints) for the body tracking
+    for (idx, (kx, ky, kc)) in kpts.iter().enumerate() {
+        if *kc > 0.4 && idx > 4 { // Skip face points from pose model to avoid clutter
+            imageproc::drawing::draw_filled_circle_mut(img, (((kx - dx) / scale) as i32, ((ky - dy) / scale) as i32), 3, Rgb([255, 255, 255]));
         }
     }
 }
