@@ -1,5 +1,5 @@
 /target
+/known_faces
 *.onnx
 output.jpg
 test.jpg
-Cargo.lock

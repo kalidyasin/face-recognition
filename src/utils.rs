@@ -1,7 +1,7 @@
+use ab_glyph::{FontRef, PxScale};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
 use imageproc::drawing::{draw_hollow_rect_mut, draw_text_mut};
 use ndarray::{Array, Array4};
-use ab_glyph::{FontRef, PxScale};
 
 // Pre-process image for YOLO (Letterbox resize - Centered)
 pub fn preprocess_yolo(
@@ -65,7 +65,15 @@ pub fn draw_bbox(
         let font_data = include_bytes!("../font.ttf");
         let font = FontRef::try_from_slice(font_data).unwrap();
         let scale = PxScale::from(16.0);
-        draw_text_mut(img, Rgb([255, 255, 255]), x as i32, (y as i32 - 18).max(0), scale, &font, text);
+        draw_text_mut(
+            img,
+            Rgb([255, 255, 255]),
+            x as i32,
+            (y as i32 - 18).max(0),
+            scale,
+            &font,
+            text,
+        );
     }
 }
 
@@ -83,22 +91,38 @@ pub fn iou(box1: &(f32, f32, f32, f32), box2: &(f32, f32, f32, f32)) -> f32 {
     let area1 = w1 * h1;
     let area2 = w2 * h2;
     let union_area = area1 + area2 - inter_area;
-    if union_area == 0.0 { 0.0 } else { inter_area / union_area }
+    if union_area == 0.0 {
+        0.0
+    } else {
+        inter_area / union_area
+    }
 }
 
 // NMS
 pub fn nms(boxes: &Vec<(f32, f32, f32, f32, f32, usize)>, iou_threshold: f32) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..boxes.len()).collect();
-    indices.sort_by(|&a, &b| boxes[b].4.partial_cmp(&boxes[a].4).unwrap_or(std::cmp::Ordering::Equal));
+    indices.sort_by(|&a, &b| {
+        boxes[b]
+            .4
+            .partial_cmp(&boxes[a].4)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut keep = Vec::new();
     while !indices.is_empty() {
         let current = indices[0];
         keep.push(current);
         let mut next_indices = Vec::new();
         for &idx in indices.iter().skip(1) {
-            let box1 = (boxes[current].0, boxes[current].1, boxes[current].2, boxes[current].3);
+            let box1 = (
+                boxes[current].0,
+                boxes[current].1,
+                boxes[current].2,
+                boxes[current].3,
+            );
             let box2 = (boxes[idx].0, boxes[idx].1, boxes[idx].2, boxes[idx].3);
-            if iou(&box1, &box2) <= iou_threshold { next_indices.push(idx); }
+            if iou(&box1, &box2) <= iou_threshold {
+                next_indices.push(idx);
+            }
         }
         indices = next_indices;
     }

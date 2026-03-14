@@ -21,7 +21,7 @@ impl YoloModel {
         conf_threshold: f32,
     ) -> Result<Vec<Detection>> {
         let tensor = Tensor::from_array(input_tensor)?;
-        // Use positional inputs for robustness if names are uncertain, 
+        // Use positional inputs for robustness if names are uncertain,
         // but YOLOv8 exports usually name it "images"
         let inputs = ort::inputs!["images" => tensor];
         let outputs = self.session.run(inputs)?;
@@ -79,7 +79,9 @@ impl YoloModel {
                         let mut max_val = -f32::INFINITY;
                         for j in 0..16 {
                             let val = data[(i * 16 + j) * h * w + offset];
-                            if val > max_val { max_val = val; }
+                            if val > max_val {
+                                max_val = val;
+                            }
                         }
                         for j in 0..16 {
                             let exp_val = (data[(i * 16 + j) * h * w + offset] - max_val).exp();
@@ -175,7 +177,8 @@ impl FaceRecognizer {
     }
 
     pub fn get_embedding(&mut self, face_img: &image::RgbImage) -> Result<Array1<f32>> {
-        let resized = image::imageops::resize(face_img, 112, 112, image::imageops::FilterType::Triangle);
+        let resized =
+            image::imageops::resize(face_img, 112, 112, image::imageops::FilterType::Triangle);
         let mut input = Array4::zeros((1, 3, 112, 112));
         for (x, y, pixel) in resized.enumerate_pixels() {
             let [r, g, b] = pixel.0;
@@ -185,15 +188,16 @@ impl FaceRecognizer {
             input[[0, 2, y as usize, x as usize]] = (r as f32 - 127.5) / 128.0;
         }
         let tensor = Tensor::from_array(input)?;
-        
+
         // Auto-detect input name for the recognition model
         let input_name = self.session.inputs()[0].name().to_string();
-        let inputs: Vec<(String, ort::session::SessionInputValue)> = vec![(input_name, tensor.into())];
-        
+        let inputs: Vec<(String, ort::session::SessionInputValue)> =
+            vec![(input_name, tensor.into())];
+
         let outputs = self.session.run(inputs)?;
         let output_value = outputs.values().next().unwrap();
         let (_, data) = output_value.try_extract_tensor::<f32>()?;
-        
+
         let mut embedding = Array1::from_vec(data.to_vec());
         let norm = embedding.dot(&embedding).sqrt();
         embedding /= norm.max(1e-6);
